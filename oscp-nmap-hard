@@ -1,0 +1,64 @@
+#!/bin/bash
+# oscp-nmap-hard <target-ip> — heavier Nmap-only deep scan for ONE chosen target.
+# Nmap + local parsing only. NSE: default,safe (never vuln/exploit/brute/dos).
+set -o pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+usage(){ cat <<EOF
+Usage: oscp-nmap-hard <target-ip>
+Heavier targeted Nmap-only scan -- default NSE only (-sC; no vuln/exploit/brute/dos). Requires typing YES.
+Reuses open_tcp_ports.txt if present; ONE full -p- sweep -> deep -sV/-sC on all open ports, top-200 UDP (no -O).
+Output: <artifact-root>/targets/<ip>/  (files prefixed 10_, 12_)
+EOF
+}
+case "$1" in -h|--help) usage; exit 0;; esac
+[ $# -eq 1 ] || { echo "ERROR: supply exactly one target IP." >&2; usage; exit 2; }
+IP="$1"
+echo "$IP" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || { echo "ERROR: '$IP' is not an IPv4 address." >&2; usage; exit 2; }
+for o in $(echo "$IP" | tr '.' ' '); do [ "$o" -le 255 ] 2>/dev/null || { echo "ERROR: invalid IPv4 octet." >&2; exit 2; }; done
+command -v nmap >/dev/null 2>&1 || { echo "ERROR: nmap not installed." >&2; exit 3; }
+
+ROOT="${OSCP_ARTIFACTS:-/mnt/hgfs/_oscp_artifacts}"
+{ [ -d "$ROOT" ] && [ -w "$ROOT" ]; } || { echo "ERROR: artifact share is not writable: $ROOT" >&2; exit 4; }
+DIR="$ROOT/targets/$IP"; mkdir -p "$DIR" || { echo "ERROR: cannot create $DIR" >&2; exit 4; }
+LOG="$DIR/commands.log"
+logcmd(){ echo "[$(date '+%F %T %Z')] $*" >> "$LOG"; }
+run(){ echo "[*] $*"; logcmd "$*"; eval "$*"; }
+
+echo "This is a heavier targeted Nmap scan. Do not run this broadly. Continue? type YES"
+read -r ans
+[ "$ans" = "YES" ] || { echo "Aborted (no changes)."; exit 0; }
+
+{ echo "===== oscp-nmap-hard ====="; echo "time: $(date '+%F %T %Z')"; echo "target: $IP";
+  echo "user: $(id -un)  host: $(hostname)  cwd: $(pwd)"; } >> "$LOG"
+
+if [ -s "$DIR/open_tcp_ports.txt" ]; then
+  PORTS=$(cat "$DIR/open_tcp_ports.txt"); echo "[*] reusing open TCP ports: $PORTS"
+else
+  echo "[*] no open_tcp_ports.txt found; running ONE full TCP sweep (all 65535 ports)."
+  run "nmap -Pn -p- --min-rate 1500 --reason -oN \"$DIR/02_full_tcp.nmap\" \"$IP\""
+  grep -E '^[0-9]+/tcp' "$DIR/02_full_tcp.nmap" 2>/dev/null | awk '$2=="open"{split($1,a,"/");print a[1]}' | sort -n -u | paste -sd, > "$DIR/open_tcp_ports.txt"
+  PORTS=$(cat "$DIR/open_tcp_ports.txt")
+fi
+if [ -z "$PORTS" ]; then
+  echo "[*] no open TCP ports; updating summary and exiting."
+  SUMM=$(command -v oscp-nmap-summary 2>/dev/null); [ -x "$SUMM" ] || SUMM=/usr/local/bin/oscp-nmap-summary; [ -x "$SUMM" ] || SUMM="$SCRIPT_DIR/oscp-nmap-summary"; [ -x "$SUMM" ] && "$SUMM" "$IP" >/dev/null 2>&1
+  exit 0
+fi
+
+run "nmap -Pn -sV --version-all -sC --reason -p \"$PORTS\" -oN \"$DIR/10_hard_tcp_services.nmap\" \"$IP\""
+
+if [ "$(id -u)" -eq 0 ]; then SU=""
+elif command -v sudo >/dev/null 2>&1; then SU="sudo"
+else SU="SKIP"; fi
+if [ "$SU" != "SKIP" ]; then
+  # OS detection (-O) intentionally dropped: too many probes / too much traffic
+  # for the payoff — the open-port fingerprint IDs the OS well enough on these labs.
+  run "$SU nmap -Pn -sU --top-ports 200 --reason -oN \"$DIR/12_hard_udp_top200.nmap\" \"$IP\""
+  grep -E '^[0-9]+/udp' "$DIR/12_hard_udp_top200.nmap" 2>/dev/null | grep -i open | awk -F/ '{print $1}' | sort -n -u | paste -sd, > "$DIR/open_udp_ports.txt"
+else
+  echo "[warn] sudo not available; skipping UDP scan." >&2
+fi
+
+SUMM=$(command -v oscp-nmap-summary 2>/dev/null); [ -x "$SUMM" ] || SUMM=/usr/local/bin/oscp-nmap-summary; [ -x "$SUMM" ] || SUMM="$SCRIPT_DIR/oscp-nmap-summary"; [ -x "$SUMM" ] && "$SUMM" "$IP" >/dev/null 2>&1
+echo "[*] DONE (hard). Folder : $DIR"
+echo "[*]              Summary: $DIR/services_summary.txt"

@@ -1,0 +1,7 @@
+* text=auto
+
+fullrecon text eol=lf
+oscp-* text eol=lf
+*.md text eol=lf
+LICENSE text eol=lf
+

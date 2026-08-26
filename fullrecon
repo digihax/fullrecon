@@ -1,0 +1,255 @@
+#!/bin/bash
+# fullrecon — OSCP-safe multi-target recon orchestrator (ENUMERATION/DOCUMENTATION ONLY).
+# Does NOT exploit, brute force, crawl, fuzz, run vuln scanners, run AI, run Metasploit,
+# use Responder, or make decisions. Sequential. No CIDR. No subnet sweeps.
+set -o pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+usage(){ cat <<EOF
+Usage:
+  fullrecon <ip> [ip...]        recon targets (phase1 quick -> phase2 web -> phase3 hard)
+  fullrecon -f ips.txt          read IPv4s from file (# comments and blank lines ignored)
+  fullrecon --phase1-only ...   only quick/light nmap
+  fullrecon --no-hard ...       phase1 + web only (skip hard)
+  fullrecon --hard-only <ip>... only the hard phase
+  fullrecon --web-only <ip>...  only web metadata/screenshots
+  fullrecon --resume ...        skip phases whose output already exists
+  fullrecon --force ...         re-run even if output exists
+  fullrecon --confirm-hard ...  prompt before the heavier phase-3 (OFF by default)
+  fullrecon --yes ...           assume yes to any prompt (back-compat; default already runs)
+  fullrecon --allow-many ...    permit more than 8 targets
+  fullrecon --allow-risk ...    skip the routing-scope guard (LAN-leak check)
+  fullrecon --help
+Enumeration/documentation only. No exploit/brute/crawl/fuzz/scanners/AI/MSF/Responder.
+EOF
+}
+ART(){
+  local r="${OSCP_ARTIFACTS:-/mnt/hgfs/_oscp_artifacts}"
+  { [ -d "$r" ] && [ -w "$r" ]; } && echo "$r" || {
+    echo "ERROR: artifact share is not writable: $r" >&2
+    echo "       Mount/fix the Kali shared folder or set OSCP_ARTIFACTS." >&2
+    exit 4
+  }
+}
+have(){ command -v "$1" >/dev/null 2>&1; }
+run_helper(){
+  local helper="$1"; shift
+  if have "$helper"; then "$helper" "$@"
+  elif [ -x "/usr/local/bin/$helper" ]; then "/usr/local/bin/$helper" "$@"
+  elif [ -x "$SCRIPT_DIR/$helper" ]; then "$SCRIPT_DIR/$helper" "$@"
+  else return 127
+  fi
+}
+helper_exists(){
+  local helper="$1"
+  have "$helper" || [ -x "/usr/local/bin/$helper" ] || [ -x "$SCRIPT_DIR/$helper" ]
+}
+SUMM(){ run_helper oscp-nmap-summary "$@" || true; }
+summary_stamp(){ date +%m-%d-%Y-%H.%M; }
+standard_summary_copy(){
+  local ip="$1" base="$2" cmd="$3"
+  local srcd="$ROOT/targets/$ip" dstd="$ROOT/targets/$ip" ts txt
+  [ -f "$srcd/$base.txt" ] || srcd="$ROOT/scans/$ip"
+  [ -f "$srcd/$base.txt" ] || return 0
+  ts="$(summary_stamp)"
+  mkdir -p "$dstd"
+  txt="$dstd/$ts-$cmd-$ip.txt"
+  cp -f "$srcd/$base.txt" "$txt"
+  log "standard summary $ip $base -> $txt"
+}
+# OSCP challenge-lab odd ports — phase1 is top-100 only and would miss these, so we
+# scan them explicitly in phase1 (phase3/oscp-nmap-hard does a full -p- regardless).
+ODD_PORTS="1978,3000,3001,3003,8000,8080,8083,8443,9099,9999,20000"
+
+IPS=(); FILE=""; P1ONLY=0; NOHARD=0; HARDONLY=0; WEBONLY=0; RESUME=0; FORCE=0; YES=0; ALLOWMANY=0; CONFIRM=0; SCOPE_ALLOW=0
+while [ $# -gt 0 ]; do case "$1" in
+  -h|--help) usage; exit 0;;
+  -f) shift; FILE="$1";;
+  --phase1-only) P1ONLY=1;;
+  --no-hard) NOHARD=1;;
+  --hard-only) HARDONLY=1;;
+  --web-only) WEBONLY=1;;
+  --resume) RESUME=1;;
+  --force) FORCE=1;;
+  --yes) YES=1;;
+  --confirm-hard) CONFIRM=1;;
+  --allow-many) ALLOWMANY=1;;
+  --allow-risk) SCOPE_ALLOW=1;;
+  --*) echo "unknown option: $1" >&2; usage; exit 2;;
+  *) IPS+=("$1");;
+esac; shift; done
+
+if [ -n "$FILE" ]; then
+  [ -f "$FILE" ] || { echo "ERROR: file not found: $FILE" >&2; exit 2; }
+  while IFS= read -r line; do
+    line="${line%%#*}"; line="$(echo "$line" | tr -d '[:space:]')"
+    [ -n "$line" ] && IPS+=("$line")
+  done < "$FILE"
+fi
+[ "${#IPS[@]}" -gt 0 ] || { echo "ERROR: no targets supplied." >&2; usage; exit 2; }
+
+declare -A SEEN; TARGETS=()
+ipre='^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$'
+for ip in "${IPS[@]}"; do
+  case "$ip" in */*) echo "ERROR: CIDR ranges not allowed: $ip" >&2; exit 2;; esac
+  if ! [[ "$ip" =~ $ipre ]]; then echo "ERROR: not an IPv4 address (hostnames and CIDR are rejected): $ip" >&2; exit 2; fi
+  for o in "${BASH_REMATCH[@]:1}"; do [ "$o" -le 255 ] || { echo "ERROR: bad octet in $ip" >&2; exit 2; }; done
+  [ -n "${SEEN[$ip]}" ] && continue; SEEN[$ip]=1; TARGETS+=("$ip")
+done
+
+if [ "${#TARGETS[@]}" -gt 12 ] && [ "$ALLOWMANY" -eq 0 ]; then
+  echo "ERROR: ${#TARGETS[@]} targets supplied (>12). Re-run with --allow-many if intentional." >&2; exit 2
+fi
+firstnet=$(echo "${TARGETS[0]}" | cut -d. -f1-3); mixed=0
+for ip in "${TARGETS[@]}"; do [ "$(echo "$ip"|cut -d. -f1-3)" = "$firstnet" ] || mixed=1; done
+if [ "$mixed" -eq 1 ]; then
+  echo "WARNING: targets span more than one /24 subnet (no subnet is hard-coded; just confirm)."
+  if [ "$YES" -eq 0 ]; then read -r -p "Continue anyway? type YES: " a; [ "$a" = YES ] || { echo "aborted."; exit 0; }; fi
+fi
+
+ROOT=$(ART)
+TS=$(date +%Y%m%d-%H%M%S); RUN="$ROOT/runs/fullrecon_$TS"
+mkdir -p "$RUN" "$ROOT/targets"
+printf '%s\n' "${TARGETS[@]}" > "$RUN/targets.txt"
+LOG="$RUN/fullrecon.log"
+log(){ echo "[$(date '+%F %T %Z')] $*" >> "$LOG"; }
+runcmd(){ log "CMD: $*"; "$@" >>"$LOG" 2>&1; }
+log "start targets=${TARGETS[*]} flags: p1only=$P1ONLY nohard=$NOHARD hardonly=$HARDONLY webonly=$WEBONLY resume=$RESUME force=$FORCE yes=$YES"
+echo "run folder: $RUN"
+
+P1TSV="$RUN/phase1_status.tsv"; printf 'ip\tstatus\topen_tcp\n' > "$P1TSV"
+P2TSV="$RUN/phase2_web_status.tsv"; printf 'ip\tport\tscheme\tcode\tshot\ttitle\n' > "$P2TSV"
+P3TSV="$RUN/phase3_hard_status.tsv"; printf 'ip\tstatus\n' > "$P3TSV"
+
+for ip in "${TARGETS[@]}"; do have oscp-target && oscp-target "$ip" >/dev/null 2>&1; mkdir -p "$ROOT/targets/$ip"; done
+n=${#TARGETS[@]}
+
+# ---------- routing-scope guard: never scan something that would leak to the home LAN ----------
+if have scope_route_check.sh; then
+  SCOPEOUT="$RUN/scope_route_check.txt"
+  if scope_route_check.sh "${TARGETS[@]}" > "$SCOPEOUT" 2>&1; then
+    log "scope check OK"; echo "scope check: OK (no LAN-leak risk) -> $SCOPEOUT"
+  else
+    cat "$SCOPEOUT"
+    if [ "$SCOPE_ALLOW" -eq 0 ]; then
+      echo "ABORT: target(s) classified LOCAL_LAN_RISK/UNKNOWN -> would scan off-VPN (your home LAN)." >&2
+      echo "       Fix routing/VPN, or re-run with --allow-risk to override. (table: $SCOPEOUT)" >&2
+      log "scope check FAILED -> abort"; exit 3
+    fi
+    echo "(scope guard flagged risk; continuing because --allow-risk)"; log "scope risk -> continue (--allow-risk)"
+  fi
+else
+  log "scope_route_check.sh not installed; scope guard skipped"
+fi
+
+# ---------- PHASE 1: quick/light ----------
+if [ "$HARDONLY" -eq 0 ] && [ "$WEBONLY" -eq 0 ]; then
+  echo "== Phase 1: quick/light nmap (top-100, -sV --version-light) =="
+  i=0
+  for ip in "${TARGETS[@]}"; do
+    i=$((i+1)); D="$ROOT/targets/$ip"
+    if [ "$RESUME" -eq 1 ] && [ "$FORCE" -eq 0 ] && [ -f "$D/00_phase1_top100_sV.nmap" ]; then
+      ports=$(cat "$D/phase1_open_tcp_ports.txt" 2>/dev/null)
+      echo "[$i/$n] $ip phase1... SKIP (exists) ports: ${ports:-?}"
+      printf '%s\tskip\t%s\n' "$ip" "$ports" >> "$P1TSV"; log "phase1 $ip skip"; continue
+    fi
+    printf '[%s/%s] %s phase1... ' "$i" "$n" "$ip"
+    runcmd nmap -Pn --top-ports 100 -sV --version-light --reason -oN "$D/00_phase1_top100_sV.nmap" "$ip"; rc=$?
+    runcmd nmap -Pn -p "$ODD_PORTS" -sV --version-light --reason -oN "$D/00b_phase1_oddports.nmap" "$ip"   # OSCP challenge-lab odd ports
+    grep -hE '^[0-9]+/tcp' "$D/00_phase1_top100_sV.nmap" "$D/00b_phase1_oddports.nmap" 2>/dev/null | awk '$2=="open"{split($1,a,"/");print a[1]}' | sort -n -u | paste -sd, > "$D/phase1_open_tcp_ports.txt"
+    ports=$(cat "$D/phase1_open_tcp_ports.txt")
+    SUMM "$ip" --only '00*.nmap' --out phase1_services_summary >/dev/null 2>&1
+    standard_summary_copy "$ip" phase1_services_summary fullrecon-phase1
+    SUMM "$ip" >/dev/null 2>&1
+    standard_summary_copy "$ip" services_summary fullrecon
+    if [ "$rc" -eq 0 ]; then echo "OK ports: ${ports:-none}"; printf '%s\tok\t%s\n' "$ip" "$ports" >> "$P1TSV"; log "phase1 $ip ok ports=$ports"
+    else echo "ERROR (see log)"; printf '%s\terror\t%s\n' "$ip" "$ports" >> "$P1TSV"; log "phase1 $ip error rc=$rc"; fi
+  done
+fi
+
+# ---------- PHASE 2: web metadata + screenshots ----------
+if [ "$P1ONLY" -eq 0 ] && [ "$HARDONLY" -eq 0 ]; then
+  echo "== Phase 2: web metadata + screenshots =="
+  for ip in "${TARGETS[@]}"; do
+    SUM="$(ls -1t "$ROOT/targets/$ip/"*"-webshot-$ip.txt" 2>/dev/null | head -1)"
+    if [ "$RESUME" -eq 1 ] && [ "$FORCE" -eq 0 ] && [ -f "$SUM" ]; then echo "$ip web... SKIP (exists)"; log "web $ip skip"; continue; fi
+    if helper_exists oscp-webshot; then
+      while IFS=$'\t' read -r tag a b c d e rest; do
+        if [ "$tag" = "WEBSHOT_RESULT" ]; then
+          printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$a" "$b" "$c" "$d" "$e" "$rest" >> "$P2TSV"
+          echo "  $a $c://$a:$b/ [$d] shot:$e ${rest:+- $rest}"
+        fi
+      done < <(run_helper oscp-webshot "$ip")
+      log "web $ip done"
+    else echo "  oscp-webshot not installed -- skipping web phase"; log "web $ip skipped (no oscp-webshot)"; fi
+  done
+fi
+
+# ---------- PHASE 3: hard (gated) ----------
+if [ "$P1ONLY" -eq 0 ] && [ "$NOHARD" -eq 0 ] && [ "$WEBONLY" -eq 0 ]; then
+  echo "== Phase 3: hard nmap (sequential, heavier) =="
+  GO=1
+  if [ "$CONFIRM" -eq 1 ] && [ "$YES" -eq 0 ]; then
+    echo "Phase 3 runs oscp-nmap-hard sequentially for each target (heavier)."
+    read -r -p "Type YES to continue: " a; [ "$a" = YES ] || { echo "Phase 3 skipped."; log "phase3 declined"; GO=0; }
+  else
+    echo "(running hard scans; no prompt -- pass --confirm-hard if you want a gate)"
+  fi
+  if [ "$GO" -eq 1 ]; then
+    for ip in "${TARGETS[@]}"; do
+      D="$ROOT/targets/$ip"
+      if [ "$RESUME" -eq 1 ] && [ "$FORCE" -eq 0 ] && [ -f "$D/10_hard_tcp_services.nmap" ]; then echo "$ip hard... SKIP (exists)"; printf '%s\tskip\n' "$ip" >> "$P3TSV"; log "hard $ip skip"; continue; fi
+      printf '%s hard scan... ' "$ip"
+      printf 'YES\n' | run_helper oscp-nmap-hard "$ip" >>"$LOG" 2>&1; rc=$?     # fullrecon already gated above
+      SUMM "$ip" >/dev/null 2>&1
+      standard_summary_copy "$ip" services_summary fullrecon
+      helper_exists qreport && run_helper qreport "$ip" >/dev/null 2>&1
+      if [ "$rc" -eq 0 ]; then echo "OK summary updated"; printf '%s\tok\n' "$ip" >> "$P3TSV"; log "hard $ip ok"
+      else echo "ERROR (see log)"; printf '%s\terror\n' "$ip" >> "$P3TSV"; log "hard $ip error rc=$rc"; fi
+    done
+  fi
+fi
+
+# ---------- per-target manual next checks (service triage) ----------
+if have oscp-service-triage; then
+  for ip in "${TARGETS[@]}"; do
+    D="$ROOT/targets/$ip"
+    if ls "$D"/*.gnmap >/dev/null 2>&1; then
+      oscp-service-triage "$D"/*.gnmap > "$D/manual_next_checks.md" 2>/dev/null && log "triage $ip -> $D/manual_next_checks.md"
+    fi
+  done
+fi
+
+# ---------- run summary ----------
+RS="$RUN/run_summary.md"
+{
+  echo "# fullrecon run -- $TS"; echo
+  echo "Targets: ${TARGETS[*]}"; echo
+  echo "## Phase 1 (quick/light)"; echo '```'; cat "$P1TSV"; echo '```'
+  echo "## Phase 2 (web)"; echo '```'; cat "$P2TSV"; echo '```'
+  echo "## Phase 3 (hard)"; echo '```'; cat "$P3TSV"; echo '```'
+  echo "## Per-target paths & next checks"
+  for ip in "${TARGETS[@]}"; do
+    echo; echo "### $ip"
+    echo "- target folder    : $ROOT/targets/$ip/"
+    echo "- manual triage    : $ROOT/targets/$ip/manual_next_checks.md"
+    echo "- service summary  : $ROOT/targets/$ip/services_summary.txt"
+    latest_std="$(ls -1t "$ROOT/targets/$ip/"*"-fullrecon-$ip.txt" 2>/dev/null | head -1)"
+    [ -n "$latest_std" ] && echo "- std summary      : $latest_std"
+    latest_web="$(ls -1t "$ROOT/targets/$ip/"*"-webshot-$ip.txt" 2>/dev/null | head -1)"
+    [ -n "$latest_web" ] && echo "- web summary      : $latest_web"
+    echo "- screenshots      : $ROOT/targets/$ip/*-webshot-$ip-*.png"
+    echo "- report stub      : $ROOT/targets/$ip/report_stub.md"
+    if [ -f "$ROOT/targets/$ip/services_summary.txt" ]; then
+      echo "- manual next checks:"
+      sed -n '/--- MANUAL NEXT CHECKS ---/,$p' "$ROOT/targets/$ip/services_summary.txt" | sed '1d;/^$/d;s/^/    /'
+    fi
+  done
+  echo; echo "## Reminder"
+  echo "Review manually. This tool does not exploit, crawl, brute force, fuzz, or make decisions."
+} > "$RS"
+
+for ip in "${TARGETS[@]}"; do helper_exists qnote && run_helper qnote "$ip" "fullrecon completed: $RUN" >/dev/null 2>&1; done
+
+echo "== done =="
+echo "run summary: $RS"
+log "complete"

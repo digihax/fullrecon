@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""oscp-nmap-summary <target-ip>
+Parse all Nmap .nmap (normal output) in <artifact-root>/targets/<ip>/ into
+services_summary.txt. Stdlib only. Enumeration-only (no exploit advice).
+Writes ATOMICALLY (temp file + os.replace) so concurrent runs can't corrupt output."""
+import sys, os, glob, re, tempfile
+from datetime import datetime
+
+def usage():
+    print("Usage: oscp-nmap-summary <target-ip> [--only <glob>] [--out <basename>]")
+    print("  --only <glob>   only parse .nmap matching glob in the scan dir (default *.nmap)")
+    print("  --out <name>    output basename (default services_summary -> .txt)")
+
+def artifact_root():
+    shared = os.environ.get("OSCP_ARTIFACTS", "/mnt/hgfs/_oscp_artifacts")
+    if os.path.isdir(shared) and os.access(shared, os.W_OK):
+        return shared
+    raise SystemExit(f"ERROR: artifact share is not writable: {shared}")
+
+def valid_ip(ip):
+    p = ip.split(".")
+    if len(p) != 4: return False
+    try: return all(0 <= int(x) <= 255 for x in p)
+    except ValueError: return False
+
+HINTS = {
+ 21:"ftp: Manually check anonymous login and record version.",
+ 22:"ssh: Record version; try known creds only if discovered elsewhere.",
+ 23:"telnet: Record banner/presence; manual check only.",
+ 25:"smtp: Record banner; manual VRFY/user enum only if appropriate.",
+ 53:"dns: Manual zone/record checks if appropriate.",
+ 80:"http: Browse manually from host browser; capture title, tech stack, directories if discovered.",
+ 88:"kerberos: Likely AD/DC indicator; perform manual AD enumeration with provided/discovered creds.",
+ 110:"pop3: Record banner; manual check.",
+ 111:"rpcbind: Manual rpcinfo/NFS enumeration with allowed tools.",
+ 135:"msrpc: Likely Windows; manual RPC enumeration.",
+ 139:"netbios-ssn: Manual SMB/NetBIOS enumeration with allowed tools.",
+ 143:"imap: Record banner; manual check.",
+ 161:"snmp: Manual SNMP enumeration with allowed tools/community strings if discovered.",
+ 389:"ldap: Likely AD/DC; manual AD enumeration with provided/discovered creds.",
+ 443:"https: Browse manually from host browser; capture title, tech stack, cert, directories if discovered.",
+ 445:"smb: Manually enumerate shares/users with allowed SMB tools.",
+ 464:"kpasswd: Likely AD/DC indicator; manual AD enumeration.",
+ 593:"rpc-over-http: Likely AD/DC indicator; manual enumeration.",
+ 636:"ldaps: Likely AD/DC indicator; manual AD enumeration.",
+ 1433:"mssql: Record version; manual check; use creds only if discovered elsewhere.",
+ 2049:"nfs: Manual showmount/NFS enumeration with allowed tools.",
+ 3268:"globalcat-ldap: Likely AD/DC indicator; manual AD enumeration.",
+ 3269:"globalcat-ldaps: Likely AD/DC indicator; manual AD enumeration.",
+ 3306:"mysql: Record version; manual check; use creds only if discovered elsewhere.",
+ 3389:"rdp: Record RDP presence; test creds only if discovered elsewhere.",
+ 5432:"postgresql: Record version; manual check; use creds only if discovered elsewhere.",
+ 5985:"winrm-http: Possible shell path if valid creds are discovered.",
+ 5986:"winrm-https: Possible shell path if valid creds are discovered.",
+}
+AD_PORTS = {88,389,445,464,593,636,3268,3269}
+
+PORT_RE = re.compile(r'^(\d+)/(tcp|udp)\s+(\S+)(?:\s+(\S+))?(?:\s+(.*))?$')
+
+def parse(d, only="*.nmap"):
+    """Parse Nmap NORMAL (-oN) output text. Extracts open ports + service/version,
+    NSE/host-script blocks (the '|' lines), hostname, and any OS lines."""
+    tcp, udp, scripts, hostname, osmatches = {}, {}, [], "", []
+    for nf in sorted(glob.glob(os.path.join(d, only))):
+        src = os.path.basename(nf)
+        try:
+            lines = open(nf, encoding="utf-8", errors="replace").read().splitlines()
+        except Exception:
+            continue
+        cur_owner = ("host", 0); in_host = False; cur_script = None; prev_pipe = False
+        def flush():
+            nonlocal cur_script
+            if cur_script:
+                op, opid, sid, buf = cur_script
+                out = "\n".join(buf).strip()
+                if out: scripts.append((op, opid, sid, out, src))
+                cur_script = None
+        for ln in lines:
+            mh = re.match(r'^Nmap scan report for (.+)$', ln)
+            if mh:
+                flush(); prev_pipe = False; in_host = False; cur_owner = ("host", 0)
+                m2 = re.match(r'^(\S.*?)\s+\(([\d.]+)\)$', mh.group(1).strip())
+                if m2: hostname = m2.group(1)
+                continue
+            if ln.strip() == "Host script results:":
+                flush(); in_host = True; prev_pipe = False; continue
+            if not ln.startswith('|'):
+                mp = PORT_RE.match(ln)
+                if mp:
+                    flush(); prev_pipe = False
+                    pid = int(mp.group(1)); proto = mp.group(2); state = mp.group(3)
+                    if "open" in state:
+                        name = mp.group(4) or ""; ver = (mp.group(5) or "").strip()
+                        rec = {"port":pid,"proto":proto,"state":state,"name":name,
+                               "product":"","version":ver,"extra":"","host":hostname,"src":src}
+                        tbl = tcp if proto == "tcp" else udp
+                        old = tbl.get(pid)
+                        if old is None or len(ver) > len(old["version"]):
+                            tbl[pid] = rec
+                        cur_owner = (proto, pid); in_host = False
+                    continue
+                if prev_pipe: flush()
+                prev_pipe = False
+                mo = re.match(r'^OS details:\s*(.+)$', ln)
+                if mo: osmatches.append(mo.group(1).strip())
+                mo3 = re.match(r'^Aggressive OS guesses:\s*(.+)$', ln)
+                if mo3: osmatches.append(re.sub(r'\s*\(\d+%\).*', '', mo3.group(1)).strip())
+                if ln.startswith('Service Info:'):
+                    scripts.append(("host", 0, "service-info", ln.strip(), src))
+                continue
+            # '|' line = NSE script output (port script or host script)
+            body = ln[1:]
+            if body[:1] == '_': body = body[1:]
+            if not prev_pipe:
+                stripped = body.strip()
+                sid = (stripped.split(':', 1)[0].strip() or "script")
+                rest = stripped.split(':', 1)[1].strip() if ':' in stripped else ""
+                owner = ("host", 0) if in_host else cur_owner
+                cur_script = (owner[0], owner[1], sid, ([rest] if rest else []))
+            elif cur_script:
+                cur_script[3].append(body.strip())
+            prev_pipe = True
+        flush()
+    for tbl in (tcp, udp):
+        for r in tbl.values():
+            if not r["host"]: r["host"] = hostname
+    return tcp, udp, scripts, hostname, osmatches
+
+def key_facts(tcp, udp, scripts, osmatches):
+    tports = set(tcp); txt = "\n".join(s[3] for s in scripts)
+    wp = [p for p in (5985,5986) if p in tports]
+    winrm = ("open on " + "/".join(map(str,wp))) if wp else "not detected"
+    ad = sorted(AD_PORTS & tports)
+    domain = ""
+    m = re.search(r'(?:Forest name|FQDN|DNS[_ ]?domain[_ ]?name|Domain name)\s*[:=]\s*([A-Za-z0-9.\-]+\.[A-Za-z]{2,})', txt)
+    if m: domain = m.group(1).rstrip(".")
+    if not domain:
+        m = re.search(r'((?:DC=[^,\s]+,)+DC=[^,\s]+)', txt)
+        if m: domain = ".".join(re.findall(r'DC=([^,\s]+)', m.group(1)))
+    nb = ""
+    m = re.search(r'(?:NetBIOS[_ ]?domain[_ ]?name|Workgroup)\s*[:=]\s*([A-Za-z0-9.\-]+)', txt)
+    if m: nb = m.group(1)
+    os_str = ""
+    m = re.search(r'\bOS:\s*([^\n(]+)', txt)
+    if m: os_str = m.group(1).strip()
+    if not os_str and osmatches: os_str = osmatches[0]
+    if {88,389} <= tports or (ad and 445 in tports): role = "Domain Controller"
+    elif 445 in tports or 139 in tports: role = "Windows host (member/standalone -- confirm)"
+    elif 22 in tports: role = "Linux/Unix host"
+    else: role = "unknown"
+    clock = "Kerberos time observed; verify local time sync if auth fails" if 88 in tports else ""
+    facts = [("Likely role", role)]
+    if domain: facts.append(("Domain", domain))
+    if nb: facts.append(("NetBIOS domain", nb))
+    if os_str: facts.append(("OS", os_str))
+    facts.append(("WinRM", winrm))
+    facts.append(("AD ports present", ("yes (" + ",".join(map(str,ad)) + ")") if ad else "no"))
+    if clock: facts.append(("Clock note", clock))
+    return facts
+
+COLS = [("port","PORT"),("proto","PROTO"),("state","STATE"),("name","SERVICE"),
+        ("product","PRODUCT"),("version","VERSION"),("extra","EXTRA"),("host","HOST"),("src","SRC")]
+
+def table_txt(tbl):
+    rows = [tbl[p] for p in sorted(tbl)]
+    if not rows: return "  (none)\n"
+    w = {k:len(h) for k,h in COLS}
+    for r in rows:
+        for k,_ in COLS: w[k] = max(w[k], len(str(r.get(k,""))))
+    line = lambda vals: "  " + "  ".join(str(v).ljust(w[k]) for (k,_),v in zip(COLS,vals))
+    out = [line([h for _,h in COLS]), "  " + "  ".join("-"*w[k] for k,_ in COLS)]
+    for r in rows: out.append(line([r.get(k,"") for k,_ in COLS]))
+    return "\n".join(out) + "\n"
+
+def next_checks(tcp, udp):
+    seen, lines, ad = set(), [], False
+    for tbl in (tcp, udp):
+        for p in sorted(tbl):
+            if p in AD_PORTS: ad = True
+            if p in seen: continue
+            seen.add(p)
+            if p in HINTS: lines.append(f"- {p}/{tbl[p]['proto']} {HINTS[p]}")
+            else: lines.append(f"- {p}/{tbl[p]['proto']} {tbl[p].get('name','')}: manual service enumeration; record version/banner.")
+    if ad:
+        lines.append("- NOTE: AD/DC indicator ports present -> perform manual Active Directory enumeration with provided/discovered creds.")
+    if not lines: lines.append("- (no open ports observed yet)")
+    return "\n".join(lines) + "\n"
+
+def scripts_block(scripts):
+    if not scripts: return "  (none)\n"
+    b = []
+    for proto,pid,sid,out,src in scripts:
+        tag = f"{pid}/{proto}" if pid else "host"
+        o = out if len(out) <= 1200 else out[:1200] + " ...[truncated]"
+        b.append(f"  [{tag}] {sid}  (from {src})")
+        for ln in o.splitlines(): b.append("      " + ln)
+    return "\n".join(b) + "\n"
+
+def atomic_write(path, content):
+    d = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".summ-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f: f.write(content)
+        os.replace(tmp, path)          # atomic within the same filesystem
+    except Exception:
+        try: os.unlink(tmp)
+        except OSError: pass
+        raise
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h","--help"):
+        usage(); sys.exit(0 if args else 2)
+    ip = args[0]; only = "*.nmap"; outbase = "services_summary"; rest = args[1:]
+    while rest:
+        a = rest.pop(0)
+        if a == "--only" and rest: only = rest.pop(0)
+        elif a == "--out" and rest: outbase = rest.pop(0)
+    if not valid_ip(ip):
+        print(f"ERROR: '{ip}' is not an IPv4 address."); usage(); sys.exit(2)
+    root = artifact_root()
+    d = os.path.join(root, "targets", ip)
+    if not os.path.isdir(d):
+        old = os.path.join(root, "scans", ip)
+        if os.path.isdir(old):
+            d = old
+    if not os.path.isdir(d):
+        print(f"ERROR: no scan folder for {ip}: {d}"); sys.exit(4)
+    nmaps = glob.glob(os.path.join(d, only))
+    if not nmaps:
+        print(f"ERROR: no .nmap scan files matching '{only}' in {d}"); sys.exit(5)
+
+    tcp, udp, scripts, hostname, osmatches = parse(d, only)
+    ts = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    facts = key_facts(tcp, udp, scripts, osmatches)
+    hdr = [f"Target IP        : {ip}",
+           f"Hostname         : {hostname or '(none found)'}",
+           f"Scan folder      : {d}",
+           f"Last updated     : {ts}",
+           f"Source nmap files: {len(nmaps)}"]
+
+    # ---- TXT ----
+    t = []
+    t.append("="*70)
+    t.append("OSCP NMAP SERVICE SUMMARY")
+    t.append("="*70)
+    t += hdr
+    t.append("\n--- KEY FACTS ---")
+    for k,v in facts: t.append(f"  {k:<17}: {v}")
+    t.append("\n--- OPEN TCP PORTS ---")
+    t.append(table_txt(tcp))
+    t.append("--- OPEN UDP PORTS (open / open|filtered) ---")
+    t.append(table_txt(udp))
+    t.append("--- INTERESTING BANNERS / NSE SCRIPT OUTPUT ---")
+    t.append(scripts_block(scripts))
+    t.append("--- MANUAL NEXT CHECKS ---")
+    t.append(next_checks(tcp, udp))
+    atomic_write(os.path.join(d, outbase + ".txt"), "\n".join(t))
+
+    print(f"[summary] {len(tcp)} open TCP, {len(udp)} open UDP, {len(scripts)} script outputs")
+    print(f"[summary] role={dict(facts).get('Likely role')}  domain={dict(facts).get('Domain','-')}")
+    print(f"[summary] wrote: {os.path.join(d, outbase + '.txt')}")
+
+if __name__ == "__main__":
+    main()
