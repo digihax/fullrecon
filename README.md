@@ -5,16 +5,9 @@ targets. It wraps Nmap and local reporting helpers into a predictable phased
 workflow: quick service discovery, web metadata/screenshots, then a heavier
 single-target Nmap pass.
 
-It performs active network enumeration and writes local reports. It is not an
-exploit framework, and it does not establish permission to test a target:
-
-
-- No exploitation
-- No brute forcing
-- No crawling, fuzzing, or directory busting
-- No vulnerability scanners
-- No Metasploit or Responder
-- No hostnames or CIDR ranges
+It performs active network enumeration against explicit IPv4 targets and writes
+local reports. The workflow covers discovery and documentation rather than
+exploitation, brute forcing, crawling or vulnerability scanning.
 
 [Install](#install) · [Usage](#usage) · [Phases](#phases) ·
 [Artifacts](#generated-files) · [Limits](#limits-and-validation)
@@ -200,8 +193,8 @@ oscp-webshot 192.0.2.10
 
 ## Limits and validation
 
-- The hard phase uses Nmap default NSE scripts (`-sC`). No claim is made that every
-  installed default script is nonintrusive or approved by an exam provider.
+- The hard phase uses Nmap default NSE scripts (`-sC`). Review the scripts installed
+  on your assessment system and confirm they fit the engagement rules.
 - The screenshot helper disables Chromium's sandbox and bypasses certificate
   validation. Use an isolated assessment machine, not a browser profile with
   personal credentials. HTTP handling is not a scope-enforcement boundary.
@@ -215,17 +208,16 @@ oscp-webshot 192.0.2.10
 - Treat artifact directories, cached port lists, helper scripts and output-name
   arguments as trusted operator inputs. They are not hardened for hostile content.
 
-Static review covered all four scripts. Bash syntax and Python parsing are checked;
-the offline report parser has fixture tests:
+Bash syntax and Python parsing are checked, and the offline report parser has
+fixture tests:
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-These tests use synthetic saved output and make no network requests. No live Nmap,
-SMTP, HTTP or screenshot run is claimed by this maintenance pass. Scope guards,
-renderer behavior and supported Nmap/platform versions still need an isolated lab
-integration test before relying on them in an engagement.
+The fixtures use saved output and make no network requests. Test scope guards,
+renderer behavior and the local Nmap/platform combination in an isolated lab before
+using them in an engagement.
 
 ## License
 
